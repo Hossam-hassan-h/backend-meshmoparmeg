@@ -7,7 +7,7 @@ import Course from '../models/Course.js';
 export const getCategories = async (req, res) => {
   try {
     const categories = await Category.find().lean();
-    
+
     // Count associated courses for each category
     const categoriesWithCount = await Promise.all(
       categories.map(async (cat) => {
@@ -29,19 +29,29 @@ export const createCategory = async (req, res) => {
   try {
     const { name, description, icon } = req.body;
 
-    if (!name) {
+    if (!name || typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ message: 'Category name is required' });
     }
 
-    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
-    const exists = await Category.findOne({ $or: [{ name }, { slug }] });
+    const trimmedName = name.trim();
+    let slug = trimmedName.toLowerCase()
+      .replace(/#/g, '-sharp')
+      .replace(/\+/g, '-plus')
+      .replace(/[^\p{L}\p{N}]+/gu, '-')
+      .replace(/(^-|-$)+/g, '');
+
+    if (!slug) {
+      slug = 'category-' + Math.floor(100000 + Math.random() * 900000);
+    }
+
+    const exists = await Category.findOne({ $or: [{ name: trimmedName }, { slug }] });
 
     if (exists) {
       return res.status(400).json({ message: 'Category with this name already exists' });
     }
 
     const category = await Category.create({
-      name,
+      name: trimmedName,
       slug,
       description: description || '',
       icon: icon || 'BookOpen',
@@ -49,6 +59,13 @@ export const createCategory = async (req, res) => {
 
     res.status(201).json(category);
   } catch (error) {
+    console.error('Error in createCategory:', error);
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ message: error.message });
+    }
+    if (error.code === 11000) {
+      return res.status(400).json({ message: 'Category with this name or slug already exists' });
+    }
     res.status(500).json({ message: 'Error creating category', error: error.message });
   }
 };

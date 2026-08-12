@@ -14,7 +14,7 @@ const CourseSchema = new mongoose.Schema(
     },
     description: {
       type: String,
-      required: [true, 'Course description is required'],
+      default: '',
     },
     teachingMethodology: {
       type: String,

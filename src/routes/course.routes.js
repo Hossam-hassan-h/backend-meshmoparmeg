@@ -1,3 +1,4 @@
+
 import express from 'express';
 import {
   getCourses,
@@ -8,7 +9,8 @@ import {
   deleteCourse,
 } from '../controllers/course.controller.js';
 import { protect, authorize, checkEnrollment } from '../middleware/auth.js';
-import { upload } from '../config/cloudinary.js';
+import { upload, memoryUpload, cloudinary } from '../config/cloudinary.js';
+import { Readable } from 'stream';
 
 const router = express.Router();
 
@@ -20,14 +22,23 @@ router.get('/my-courses', protect, getMyCourses);
 router.get('/:id/content', protect, checkEnrollment, getCourseContent);
 
 // Admin protected routes
+const uploadFieldsWrapper = (req, res, next) => {
+  upload.fields([
+    { name: 'thumbnail', maxCount: 1 },
+    { name: 'video', maxCount: 1 },
+  ])(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({ message: err.message });
+    }
+    next();
+  });
+};
+
 router.post(
   '/',
   protect,
   authorize('admin'),
-  upload.fields([
-    { name: 'thumbnail', maxCount: 1 },
-    { name: 'video', maxCount: 1 },
-  ]),
+  uploadFieldsWrapper,
   createCourse
 );
 
@@ -35,13 +46,11 @@ router.put(
   '/:id',
   protect,
   authorize('admin'),
-  upload.fields([
-    { name: 'thumbnail', maxCount: 1 },
-    { name: 'video', maxCount: 1 },
-  ]),
+  uploadFieldsWrapper,
   updateCourse
 );
 
 router.delete('/:id', protect, authorize('admin'), deleteCourse);
 
 export default router;
+

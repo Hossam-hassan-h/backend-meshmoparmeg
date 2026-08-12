@@ -1,5 +1,36 @@
 import Course from '../models/Course.js';
 import Enrollment from '../models/Enrollment.js';
+import { v2 as cloudinary } from 'cloudinary';
+import { Readable } from 'stream';
+
+const uploadToCloudinary = (fileBuffer, isVideo = false) => {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: isVideo ? 'video' : 'image',
+        folder: 'education_app_media',
+      },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      }
+    );
+    Readable.from(fileBuffer).pipe(uploadStream);
+  });
+};
+
+const deleteFromCloudinary = async (publicId, isVideo = false) => {
+  try {
+    if (publicId) {
+      await cloudinary.uploader.destroy(publicId, {
+        resource_type: isVideo ? 'video' : 'image'
+      });
+      console.log(`Successfully deleted asset ${publicId} from Cloudinary`);
+    }
+  } catch (err) {
+    console.error(`Failed to delete asset ${publicId} from Cloudinary:`, err);
+  }
+};
 
 // @desc    Get all courses (Public catalog)
 // @route   GET /api/courses
@@ -18,10 +49,9 @@ export const getCourses = async (req, res) => {
       ];
     }
 
-    // Return courses omitting protected video URL for public viewers
+    // Return courses with all fields including video URL
     const courses = await Course.find(query)
       .populate('category', 'name slug icon')
-      .select('-video.url')
       .sort({ createdAt: -1 });
 
     res.json(courses);
@@ -74,9 +104,6 @@ export const getCourseContent = async (req, res) => {
   }
 };
 
-// @desc    Create a new course (Admin)
-// @route   POST /api/courses
-// @access  Private (Admin)
 export const createCourse = async (req, res) => {
   try {
     const {
@@ -91,28 +118,86 @@ export const createCourse = async (req, res) => {
       learningOutcomes,
     } = req.body;
 
-    let thumbnailUrl = req.body.thumbnailUrl;
-    let thumbnailPublicId = '';
-    let videoUrl = req.body.videoUrl;
-    let videoPublicId = '';
+    let thumbnail = {};
+    let video = {};
 
+    // 1. Process memory files if uploaded
     if (req.files) {
       if (req.files.thumbnail && req.files.thumbnail[0]) {
-        thumbnailUrl = req.files.thumbnail[0].path || req.files.thumbnail[0].secure_url;
-        thumbnailPublicId = req.files.thumbnail[0].filename || req.files.thumbnail[0].public_id;
+        console.log('Uploading course thumbnail to Cloudinary from memory buffer...');
+        const result = await uploadToCloudinary(req.files.thumbnail[0].buffer, false);
+        thumbnail = {
+          url: result.secure_url,
+          public_id: result.public_id,
+        };
       }
       if (req.files.video && req.files.video[0]) {
-        videoUrl = req.files.video[0].path || req.files.video[0].secure_url;
-        videoPublicId = req.files.video[0].filename || req.files.video[0].public_id;
+        console.log('Uploading course video to Cloudinary from memory buffer...');
+        const result = await uploadToCloudinary(req.files.video[0].buffer, true);
+        video = {
+          url: result.secure_url,
+          public_id: result.public_id,
+        };
       }
     }
 
-    if (!title || !description || !teachingMethodology) {
-      return res.status(400).json({ message: 'Title, description, and teaching methodology are required' });
+    // 2. Fallbacks for text/JSON fields
+    if (!thumbnail.url && req.body.thumbnail) {
+      thumbnail = typeof req.body.thumbnail === 'string' ? JSON.parse(req.body.thumbnail) : req.body.thumbnail;
+    }
+    if (!thumbnail.url && req.body.thumbnailUrl) {
+      thumbnail = {
+        url: req.body.thumbnailUrl,
+        public_id: req.body.thumbnailPublicId || '',
+      };
     }
 
-    if (!thumbnailUrl || !videoUrl) {
-      return res.status(400).json({ message: 'Both Thumbnail and Video are required' });
+    if (!video.url && req.body.video) {
+      video = typeof req.body.video === 'string' ? JSON.parse(req.body.video) : req.body.video;
+    }
+    if (!video.url && req.body.videoUrl) {
+      video = {
+        url: req.body.videoUrl,
+        public_id: req.body.videoPublicId || '',
+      };
+    }
+
+    if (!title) {
+      return res.status(400).json({ message: 'Title is required' });
+    }
+
+    if (!thumbnail || !thumbnail.url) {
+      return res.status(400).json({ message: 'Course Thumbnail is required' });
+    }
+
+    if (!video || !video.url) {
+      return res.status(400).json({ message: 'Lecture Video is required' });
+    }
+
+    let parsedRequirements = [];
+    if (requirements) {
+      if (Array.isArray(requirements)) {
+        parsedRequirements = requirements;
+      } else {
+        try {
+          parsedRequirements = JSON.parse(requirements);
+        } catch {
+          parsedRequirements = requirements.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      }
+    }
+
+    let parsedLearningOutcomes = [];
+    if (learningOutcomes) {
+      if (Array.isArray(learningOutcomes)) {
+        parsedLearningOutcomes = learningOutcomes;
+      } else {
+        try {
+          parsedLearningOutcomes = JSON.parse(learningOutcomes);
+        } catch {
+          parsedLearningOutcomes = learningOutcomes.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      }
     }
 
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
@@ -120,16 +205,16 @@ export const createCourse = async (req, res) => {
     const course = await Course.create({
       title,
       slug,
-      description,
+      description: description || '',
       teachingMethodology,
       difficulty: difficulty || 'Beginner',
       duration: duration || '4 Hours',
       category: category || null,
       accessType: accessType === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE',
-      requirements: Array.isArray(requirements) ? requirements : requirements ? [requirements] : [],
-      learningOutcomes: Array.isArray(learningOutcomes) ? learningOutcomes : learningOutcomes ? [learningOutcomes] : [],
-      thumbnail: { url: thumbnailUrl, public_id: thumbnailPublicId },
-      video: { url: videoUrl, public_id: videoPublicId },
+      requirements: parsedRequirements,
+      learningOutcomes: parsedLearningOutcomes,
+      thumbnail,
+      video,
     });
 
     res.status(201).json(course);
@@ -164,28 +249,94 @@ export const updateCourse = async (req, res) => {
       course.title = title;
       course.slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
     }
-    if (description) course.description = description;
+    if (description !== undefined) course.description = description;
     if (teachingMethodology) course.teachingMethodology = teachingMethodology;
     if (difficulty) course.difficulty = difficulty;
     if (duration) course.duration = duration;
     if (category !== undefined) course.category = category || null;
     if (accessType) course.accessType = accessType;
-    if (requirements !== undefined) course.requirements = Array.isArray(requirements) ? requirements : [requirements];
-    if (learningOutcomes !== undefined) course.learningOutcomes = Array.isArray(learningOutcomes) ? learningOutcomes : [learningOutcomes];
 
+    if (requirements !== undefined) {
+      if (Array.isArray(requirements)) {
+        course.requirements = requirements;
+      } else {
+        try {
+          course.requirements = JSON.parse(requirements);
+        } catch {
+          course.requirements = requirements.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      }
+    }
+
+    if (learningOutcomes !== undefined) {
+      if (Array.isArray(learningOutcomes)) {
+        course.learningOutcomes = learningOutcomes;
+      } else {
+        try {
+          course.learningOutcomes = JSON.parse(learningOutcomes);
+        } catch {
+          course.learningOutcomes = learningOutcomes.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      }
+    }
+
+    let newThumbnail = null;
+    let newVideo = null;
+
+    // 1. Process files
     if (req.files) {
       if (req.files.thumbnail && req.files.thumbnail[0]) {
-        course.thumbnail = {
-          url: req.files.thumbnail[0].path || req.files.thumbnail[0].secure_url,
-          public_id: req.files.thumbnail[0].filename || req.files.thumbnail[0].public_id,
+        console.log('Uploading new course thumbnail to Cloudinary from memory buffer...');
+        const result = await uploadToCloudinary(req.files.thumbnail[0].buffer, false);
+        newThumbnail = {
+          url: result.secure_url,
+          public_id: result.public_id,
         };
       }
       if (req.files.video && req.files.video[0]) {
-        course.video = {
-          url: req.files.video[0].path || req.files.video[0].secure_url,
-          public_id: req.files.video[0].filename || req.files.video[0].public_id,
+        console.log('Uploading new course video to Cloudinary from memory buffer...');
+        const result = await uploadToCloudinary(req.files.video[0].buffer, true);
+        newVideo = {
+          url: result.secure_url,
+          public_id: result.public_id,
         };
       }
+    }
+
+    // 2. Process text/JSON fallbacks
+    if (!newThumbnail && req.body.thumbnail) {
+      newThumbnail = typeof req.body.thumbnail === 'string' ? JSON.parse(req.body.thumbnail) : req.body.thumbnail;
+    }
+    if (!newThumbnail && req.body.thumbnailUrl) {
+      newThumbnail = {
+        url: req.body.thumbnailUrl,
+        public_id: req.body.thumbnailPublicId || '',
+      };
+    }
+
+    if (!newVideo && req.body.video) {
+      newVideo = typeof req.body.video === 'string' ? JSON.parse(req.body.video) : req.body.video;
+    }
+    if (!newVideo && req.body.videoUrl) {
+      newVideo = {
+        url: req.body.videoUrl,
+        public_id: req.body.videoPublicId || '',
+      };
+    }
+
+    // Handle Asset replacement cleanup in Cloudinary
+    if (newThumbnail && newThumbnail.url) {
+      if (course.thumbnail && course.thumbnail.public_id && course.thumbnail.public_id !== newThumbnail.public_id) {
+        await deleteFromCloudinary(course.thumbnail.public_id, false);
+      }
+      course.thumbnail = newThumbnail;
+    }
+
+    if (newVideo && newVideo.url) {
+      if (course.video && course.video.public_id && course.video.public_id !== newVideo.public_id) {
+        await deleteFromCloudinary(course.video.public_id, true);
+      }
+      course.video = newVideo;
     }
 
     await course.save();
@@ -203,6 +354,14 @@ export const deleteCourse = async (req, res) => {
     const course = await Course.findByIdAndDelete(req.params.id);
     if (!course) {
       return res.status(404).json({ message: 'Course not found' });
+    }
+
+    // Delete assets from Cloudinary
+    if (course.thumbnail && course.thumbnail.public_id) {
+      await deleteFromCloudinary(course.thumbnail.public_id, false);
+    }
+    if (course.video && course.video.public_id) {
+      await deleteFromCloudinary(course.video.public_id, true);
     }
 
     // Delete associated enrollments
