@@ -11,8 +11,13 @@ const uploadToCloudinary = (fileBuffer, isVideo = false) => {
         folder: 'education_app_media',
       },
       (error, result) => {
-        if (error) reject(error);
-        else resolve(result);
+        if (error) {
+          console.error(`Cloudinary ${isVideo ? 'video' : 'image'} upload failed:`, error);
+          reject(error);
+        } else {
+          console.log(`Cloudinary ${isVideo ? 'video' : 'image'} upload succeeded: ${result.secure_url}`);
+          resolve(result);
+        }
       }
     );
     Readable.from(fileBuffer).pipe(uploadStream);
@@ -52,9 +57,30 @@ export const getCourses = async (req, res) => {
     // Return courses with all fields including video URL
     const courses = await Course.find(query)
       .populate('category', 'name slug icon')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
-    res.json(courses);
+    // Attach allowed/enrolled users for each course
+    const courseIds = courses.map((c) => c._id);
+    const enrollments = await Enrollment.find({ courseId: { $in: courseIds } })
+      .populate('userId', 'name email avatar role')
+      .lean();
+
+    const enrollmentsByCourse = {};
+    enrollments.forEach((e) => {
+      if (e.userId) {
+        const cIdStr = e.courseId.toString();
+        if (!enrollmentsByCourse[cIdStr]) enrollmentsByCourse[cIdStr] = [];
+        enrollmentsByCourse[cIdStr].push(e.userId);
+      }
+    });
+
+    const enrichedCourses = courses.map((c) => ({
+      ...c,
+      allowedUsers: enrollmentsByCourse[c._id.toString()] || [],
+    }));
+
+    res.json(enrichedCourses);
   } catch (error) {
     res.status(500).json({ message: 'Error fetching course list', error: error.message });
   }
@@ -66,8 +92,27 @@ export const getCourses = async (req, res) => {
 export const getMyCourses = async (req, res) => {
   try {
     if (req.user.role === 'admin') {
-      const allCourses = await Course.find().populate('category', 'name icon');
-      return res.json(allCourses);
+      const allCourses = await Course.find().populate('category', 'name icon').lean();
+      const courseIds = allCourses.map((c) => c._id);
+      const enrollments = await Enrollment.find({ courseId: { $in: courseIds } })
+        .populate('userId', 'name email avatar role')
+        .lean();
+
+      const enrollmentsByCourse = {};
+      enrollments.forEach((e) => {
+        if (e.userId) {
+          const cIdStr = e.courseId.toString();
+          if (!enrollmentsByCourse[cIdStr]) enrollmentsByCourse[cIdStr] = [];
+          enrollmentsByCourse[cIdStr].push(e.userId);
+        }
+      });
+
+      const enrichedCourses = allCourses.map((c) => ({
+        ...c,
+        allowedUsers: enrollmentsByCourse[c._id.toString()] || [],
+      }));
+
+      return res.json(enrichedCourses);
     }
 
     // Get private course IDs user is explicitly enrolled in
@@ -93,10 +138,17 @@ export const getMyCourses = async (req, res) => {
 // @access  Private (Protected by checkEnrollment middleware)
 export const getCourseContent = async (req, res) => {
   try {
-    const course = await Course.findById(req.params.id).populate('category', 'name icon');
+    const course = await Course.findById(req.params.id).populate('category', 'name icon').lean();
     if (!course) {
       return res.status(404).json({ message: 'Course not found' });
     }
+
+    const enrollments = await Enrollment.find({ courseId: course._id })
+      .populate('userId', 'name email avatar role')
+      .lean();
+
+    course.allowedUsers = enrollments.map((e) => e.userId).filter(Boolean);
+
     // Return complete course data including Cloudinary video stream URL
     res.json(course);
   } catch (error) {
@@ -116,6 +168,7 @@ export const createCourse = async (req, res) => {
       accessType,
       requirements,
       learningOutcomes,
+      allowedUsers,
     } = req.body;
 
     let thumbnail = {};
@@ -206,7 +259,7 @@ export const createCourse = async (req, res) => {
       title,
       slug,
       description: description || '',
-      teachingMethodology,
+      teachingMethodology: teachingMethodology || 'Standard Curriculum',
       difficulty: difficulty || 'Beginner',
       duration: duration || '4 Hours',
       category: category || null,
@@ -216,6 +269,30 @@ export const createCourse = async (req, res) => {
       thumbnail,
       video,
     });
+
+    // Create enrollment records if restricted course
+    if (course.accessType === 'PRIVATE' && allowedUsers) {
+      let parsedAllowedUsers = [];
+      if (Array.isArray(allowedUsers)) {
+        parsedAllowedUsers = allowedUsers;
+      } else {
+        try {
+          parsedAllowedUsers = JSON.parse(allowedUsers);
+        } catch {
+          parsedAllowedUsers = allowedUsers.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      }
+
+      if (parsedAllowedUsers.length > 0) {
+        const enrollmentDocs = parsedAllowedUsers.map((userId) => ({
+          userId,
+          courseId: course._id,
+        }));
+        await Enrollment.insertMany(enrollmentDocs, { ordered: false }).catch((err) => {
+          console.log('Enrollment insertion note:', err.message);
+        });
+      }
+    }
 
     res.status(201).json(course);
   } catch (error) {
@@ -243,6 +320,7 @@ export const updateCourse = async (req, res) => {
       accessType,
       requirements,
       learningOutcomes,
+      allowedUsers,
     } = req.body;
 
     if (title) {
@@ -340,6 +418,35 @@ export const updateCourse = async (req, res) => {
     }
 
     await course.save();
+
+    // Synchronize enrollments if allowedUsers is provided
+    if (allowedUsers !== undefined) {
+      let parsedAllowedUsers = [];
+      if (Array.isArray(allowedUsers)) {
+        parsedAllowedUsers = allowedUsers;
+      } else {
+        try {
+          parsedAllowedUsers = JSON.parse(allowedUsers);
+        } catch {
+          parsedAllowedUsers = allowedUsers.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      }
+
+      // Delete existing enrollments for this course
+      await Enrollment.deleteMany({ courseId: course._id });
+
+      // If restricted, re-insert updated list
+      if (course.accessType === 'PRIVATE' && parsedAllowedUsers.length > 0) {
+        const enrollmentDocs = parsedAllowedUsers.map((userId) => ({
+          userId,
+          courseId: course._id,
+        }));
+        await Enrollment.insertMany(enrollmentDocs, { ordered: false }).catch((err) => {
+          console.log('Enrollment update note:', err.message);
+        });
+      }
+    }
+
     res.json(course);
   } catch (error) {
     res.status(500).json({ message: 'Error updating course', error: error.message });

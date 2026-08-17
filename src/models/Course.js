@@ -18,7 +18,7 @@ const CourseSchema = new mongoose.Schema(
     },
     teachingMethodology: {
       type: String,
-      required: [true, 'Teaching methodology is required'],
+      default: 'Standard Curriculum',
     },
     difficulty: {
       type: String,
