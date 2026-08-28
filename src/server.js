@@ -22,6 +22,9 @@ const app = express();
 
 app.use(helmet());
 
+app.set("trust proxy", 1);
+
+
 const allowedOrigins = [
   "https://meshmoparmeg-front.vercel.app",
   "http://localhost:5173",
