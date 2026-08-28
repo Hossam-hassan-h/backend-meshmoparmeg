@@ -24,7 +24,6 @@ app.use(
     origin: "*",
   })
 );  
-// Security Middlewares
 app.use(helmet());
 app.use(
   cors({
